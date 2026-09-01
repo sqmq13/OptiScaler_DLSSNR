@@ -631,7 +631,7 @@ static bool EnsureD3D12Device(ID3D12GraphicsCommandList* cmdList)
 static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdList,
                                                const NVSDK_NGX_Handle* InFeatureHandle,
                                                NVSDK_NGX_Parameter* InParameters,
-                                               PFN_NVSDK_NGX_ProgressCallback InCallback);
+                                               PFN_NVSDK_NGX_ProgressCallback InCallback, bool runDlssNr);
 
 static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdList, NVSDK_NGX_Feature InFeatureID,
                                              NVSDK_NGX_Parameter* InParameters, NVSDK_NGX_Handle** OutHandle)
@@ -947,7 +947,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
 static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdList,
                                                const NVSDK_NGX_Handle* InFeatureHandle,
                                                NVSDK_NGX_Parameter* InParameters,
-                                               PFN_NVSDK_NGX_ProgressCallback InCallback)
+                                               PFN_NVSDK_NGX_ProgressCallback InCallback, bool runDlssNr)
 {
     State& state = State::Instance();
     const Config& cfg = *Config::Instance();
@@ -1068,7 +1068,14 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
         ImGui::InsertNotification({ ImGuiToastType::Error, 10000, "Upscaler failed to run!" });
     }
 
-    // Restore root signatures
+    // Keep Neural Rendering inside the same state-tracking exclusion as the upscaler. It records
+    // descriptor heaps, a compute root signature, a PSO and a root table on the game's command list.
+    // Running it after RestoreRoot() would both leave those bindings live and teach the hooks that
+    // they were the game's state, so the next RE Engine compute passes could restore the NR bindings.
+    if (evalSuccess && runDlssNr)
+        DlssNr::EvaluateAfterUpscale(InCmdList, InParameters);
+
+    // Restore game state only after every injected compute pass has finished.
     if (shouldRestoreSigs)
         D3D12Hooks::RestoreRoot(InCmdList);
 
@@ -1149,17 +1156,48 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
         {
             LOG_DEBUG("Passthrough to native DLSS EvaluateFeature for handle {}", handleId);
 
+            // A native feature can reach this branch without TryEvaluateOptiFeature's restoration
+            // scope. Only append NR when the game's compute state was captured first; otherwise run
+            // the native feature unchanged and fail closed for NR instead of leaking injected state.
+            const bool wantsDlssNr =
+                cfg.DlssNrEnabled.value_or_default() && feature != NVSDK_NGX_Feature_FrameGeneration;
+            bool guardDlssNrState = false;
+
+            if (wantsDlssNr && cfg.RestoreComputeSignature.value_or_default())
+            {
+                D3D12Hooks::HookToCommandListLate(InCmdList);
+                guardDlssNrState = D3D12Hooks::CanRestoreRootSignature(InCmdList);
+
+                if (guardDlssNrState)
+                    D3D12Hooks::SetRootSignatureTracking(false);
+            }
+
             NVSDK_NGX_Result result =
                 NVNGXProxy::D3D12_EvaluateFeature()(InCmdList, InFeatureHandle, InParameters, InCallback);
             LOG_DEBUG("Native DLSS EvaluateFeature result: 0x{:X}", (uint32_t) result);
 
-            // Neural Rendering runs over what the upscaler just wrote, on the same list, so frame
-            // generation interpolates from enhanced frames and the model still costs one run per
-            // rendered frame. The feature check is the point: frame generation is handed depth and
-            // motion vectors too, and its handle can reach here because the branch above does not
-            // return, so filtering on the parameter block alone would run the model twice a frame.
-            if (result == NVSDK_NGX_Result_Success && feature != NVSDK_NGX_Feature_FrameGeneration)
-                DlssNr::EvaluateAfterUpscale(InCmdList, InParameters);
+            if (guardDlssNrState)
+            {
+                // Neural Rendering runs over what the upscaler just wrote, on the same list, so frame
+                // generation interpolates from enhanced frames and the model still costs one run per
+                // rendered frame. Tracking stays disabled until both native NGX and NR have finished.
+                if (result == NVSDK_NGX_Result_Success)
+                    DlssNr::EvaluateAfterUpscale(InCmdList, InParameters);
+
+                D3D12Hooks::RestoreRoot(InCmdList);
+                D3D12Hooks::SetRootSignatureTracking(true);
+            }
+            else if (wantsDlssNr)
+            {
+                static std::once_flag nrStateWarning;
+                std::call_once(
+                    nrStateWarning,
+                    []()
+                    {
+                        LOG_WARN(
+                            "Skipping DLSS-NR on native D3D12 feature because game compute state cannot be restored");
+                    });
+            }
 
             return result;
         }
@@ -1182,11 +1220,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
         InParameters->Set("DLSSG.CameraFar", lastDlssgCameraFar.value());
 
     // OptiScaler internal handling
-    const NVSDK_NGX_Result optiResult = TryEvaluateOptiFeature(InCmdList, InFeatureHandle, InParameters, InCallback);
-
-    // Same pass, for OptiScaler's own upscalers rather than native DLSS.
-    if (optiResult == NVSDK_NGX_Result_Success && feature != NVSDK_NGX_Feature_FrameGeneration)
-        DlssNr::EvaluateAfterUpscale(InCmdList, InParameters);
+    const NVSDK_NGX_Result optiResult = TryEvaluateOptiFeature(InCmdList, InFeatureHandle, InParameters, InCallback,
+                                                               feature != NVSDK_NGX_Feature_FrameGeneration);
 
     return optiResult;
 }
