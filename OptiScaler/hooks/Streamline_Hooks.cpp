@@ -16,6 +16,8 @@
 #include <json.hpp>
 #include <sl1_reflex.h>
 #include <magic_enum.hpp>
+#include <atomic>
+#include <mutex>
 #include "detours/detours.h"
 
 static bool IsSL1AndDLSSGActive()
@@ -1109,11 +1111,56 @@ sl::Result StreamlineHooks::hkslDLSSGSetOptions(const sl::ViewportHandle& viewpo
 
     auto& state = State::Instance();
 
+    const auto incomingMode = newOptions.mode;
+    const auto incomingFramesToGenerate = newOptions.numFramesToGenerate;
+
+    auto logNativeSetOptions = [&](const char* path, const sl::DLSSGOptions& forwardedOptions, const sl::Result result)
+    {
+        static std::atomic<uint64_t> sampleCount { 0 };
+        static std::atomic<uint64_t> previousSignature { ~uint64_t { 0 } };
+
+        const uint64_t signature = static_cast<uint64_t>(static_cast<uint32_t>(incomingMode)) |
+                                   (static_cast<uint64_t>(incomingFramesToGenerate) << 8) |
+                                   (static_cast<uint64_t>(static_cast<uint32_t>(forwardedOptions.mode)) << 16) |
+                                   (static_cast<uint64_t>(forwardedOptions.numFramesToGenerate) << 24) |
+                                   (static_cast<uint64_t>(static_cast<uint32_t>(result)) << 32);
+        const auto sample = sampleCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        const auto previous = previousSignature.exchange(signature, std::memory_order_relaxed);
+
+        if (sample <= 12 || signature != previous || sample % 240 == 0)
+        {
+            LOG_INFO(
+                "MFG_AUDIT SetOptions sample={} path={} incomingMode={}({}) incomingGenerate={} forwardedMode={}({}) "
+                "forwardedGenerate={} result={}({})",
+                sample, path, magic_enum::enum_name(incomingMode), static_cast<uint32_t>(incomingMode),
+                incomingFramesToGenerate, magic_enum::enum_name(forwardedOptions.mode),
+                static_cast<uint32_t>(forwardedOptions.mode), forwardedOptions.numFramesToGenerate,
+                magic_enum::enum_name(result), static_cast<int32_t>(result));
+        }
+    };
+
+    static std::once_flag nativeFgRouteAuditOnce;
+    std::call_once(
+        nativeFgRouteAuditOnce,
+        [&]()
+        {
+            const int interpolationOverride = Config::Instance()->FGDLSSGOverrideInterpolationCount.has_value()
+                                                  ? Config::Instance()->FGDLSSGOverrideInterpolationCount.value()
+                                                  : -1;
+            LOG_INFO("MFG_AUDIT route optiEnabled={} input={} output={} nvngx={} interpolationOverride={} "
+                     "dynamicOverride={}",
+                     Config::Instance()->FGEnabled.value_or_default(), magic_enum::enum_name(state.activeFgInput),
+                     magic_enum::enum_name(state.activeFgOutput), magic_enum::enum_name(state.activeFgNvngx),
+                     interpolationOverride, Config::Instance()->FGDLSSGOverrideForceDMFG.value_or_default());
+        });
+
     // Disable game's DLSSG when we are trying to create our own instance of DLSSG
     if (state.activeFgInput != FGInput::DLSSG && state.activeFgOutput == FGOutput::DLSSG)
     {
         newOptions.mode = sl::DLSSGMode::eOff;
-        return o_slDLSSGSetOptions(viewport, newOptions);
+        const auto result = o_slDLSSGSetOptions(viewport, newOptions);
+        logNativeSetOptions("opti-forced-off", newOptions, result);
+        return result;
     }
 
     // Make DLSSG auto always mean On
@@ -1187,7 +1234,9 @@ sl::Result StreamlineHooks::hkslDLSSGSetOptions(const sl::ViewportHandle& viewpo
 
     state.dlssgLastSetMode = newOptions.mode;
 
-    return o_slDLSSGSetOptions(viewport, newOptions);
+    const auto result = o_slDLSSGSetOptions(viewport, newOptions);
+    logNativeSetOptions("normal", newOptions, result);
+    return result;
 }
 
 sl::Result StreamlineHooks::hkslDLSSGGetState(const sl::ViewportHandle& viewport, sl::DLSSGState& state,
@@ -1284,6 +1333,48 @@ sl::Result StreamlineHooks::hkslDLSSGGetState(const sl::ViewportHandle& viewport
 
         LOG_DEBUG("Status: {}, numFramesActuallyPresented: {}", magic_enum::enum_name(state.status),
                   state.numFramesActuallyPresented);
+    }
+
+    static std::atomic<uint64_t> nativeStateSampleCount { 0 };
+    static std::atomic<uint64_t> nativeGeneratedSampleCount { 0 };
+    static std::atomic<uint32_t> nativeMaxPresented { 0 };
+    static std::atomic<uint64_t> previousNativeHealth { ~uint64_t { 0 } };
+
+    const auto nativeStateSample = nativeStateSampleCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool nativeRoute = optiState.activeFgInput == FGInput::NoFG && optiState.activeFgOutput == FGOutput::NoFG &&
+                             optiState.activeFgNvngx == FGNvngxReplacement::None;
+    const bool nativeGenerated = nativeRoute && result == sl::Result::eOk && state.status == sl::DLSSGStatus::eOk &&
+                                 state.numFramesActuallyPresented > 1;
+    uint64_t nativeGeneratedSamples = nativeGeneratedSampleCount.load(std::memory_order_relaxed);
+    bool firstNativeGeneratedSample = false;
+    if (nativeGenerated)
+    {
+        nativeGeneratedSamples = nativeGeneratedSampleCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        firstNativeGeneratedSample = nativeGeneratedSamples == 1;
+    }
+
+    auto observedMax = nativeMaxPresented.load(std::memory_order_relaxed);
+    while (observedMax < state.numFramesActuallyPresented &&
+           !nativeMaxPresented.compare_exchange_weak(observedMax, state.numFramesActuallyPresented,
+                                                     std::memory_order_relaxed))
+    {
+    }
+    observedMax = nativeMaxPresented.load(std::memory_order_relaxed);
+
+    const int optionsGenerate = options != nullptr ? static_cast<int>(options->numFramesToGenerate) : -1;
+    const uint64_t nativeHealth = static_cast<uint64_t>(static_cast<uint32_t>(result)) |
+                                  (static_cast<uint64_t>(static_cast<uint32_t>(state.status)) << 32);
+    const bool nativeHealthChanged =
+        previousNativeHealth.exchange(nativeHealth, std::memory_order_relaxed) != nativeHealth;
+    if (nativeStateSample <= 16 || firstNativeGeneratedSample || nativeHealthChanged || nativeStateSample % 240 == 0)
+    {
+        LOG_INFO("MFG_AUDIT GetState sample={} struct={} result={}({}) status=0x{:08X} presented={} returnedMax={} "
+                 "cachedMax={} optionsGenerate={} generatedSamples={} maxObservedPresented={} route={}/{}/{}",
+                 nativeStateSample, originalStructVersion, magic_enum::enum_name(result), static_cast<int32_t>(result),
+                 static_cast<uint32_t>(state.status), state.numFramesActuallyPresented,
+                 originalStructVersion >= 2 ? state.numFramesToGenerateMax : 0, optiState.dlssgMfgMax.value_or(0),
+                 optionsGenerate, nativeGeneratedSamples, observedMax, magic_enum::enum_name(optiState.activeFgInput),
+                 magic_enum::enum_name(optiState.activeFgOutput), magic_enum::enum_name(optiState.activeFgNvngx));
     }
 
     return result;
