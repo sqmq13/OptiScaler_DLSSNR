@@ -2104,11 +2104,11 @@ bool IFeature_VkwDx12::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter
         if (!reportedNrOffer)
         {
             reportedNrOffer = true;
-            LOG_INFO("DLSS-NR: the Vulkan bridge reached the hand-off (upscale ok: {}, enabled: {})",
-                     dx12EvalResult, Config::Instance()->DlssNrEnabled.value_or_default());
+            LOG_INFO("DLSS-NR: the Vulkan bridge reached the hand-off (upscale ok: {}, enabled: {})", dx12EvalResult,
+                     DlssNr::ShouldEvaluateThisSession());
         }
 
-        if (dx12EvalResult && Config::Instance()->DlssNrEnabled.value_or_default())
+        if (dx12EvalResult && DlssNr::ShouldEvaluateThisSession())
             DlssNr::EvaluateAfterUpscale(cmdList, InParameters, Dx12CommandQueue);
 
     } while (false);

@@ -3,6 +3,9 @@
 #include <d3d12.h>
 #include <nvsdk_ngx.h>
 
+#include <optional>
+#include <string>
+
 // DLSS 5 Neural Rendering, run over the upscaler's output.
 //
 // Neural Rendering is a post-process, not an upscaler and not a denoiser: it takes a finished frame plus
@@ -31,6 +34,12 @@ namespace DlssNr
 void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
                           ID3D12CommandQueue* timingQueue = nullptr);
 
+// Enabling can take effect at the next upscale. Once evaluation has begun, disabling is deliberately
+// restart-only: the undocumented NVIDIA runtime owns asynchronous work for which there is no public
+// drain primitive, so starving a live feature is not a safe teardown protocol.
+bool ShouldEvaluateThisSession();
+bool IsEvaluationLatched();
+void SetEnabledPreference(::Config* config, bool enabled);
 
 // Frame generation titles tag their UI layer through Streamline; a copy of it makes the HUD mask
 // exact at the finished frame. Called at tag time.
@@ -49,7 +58,7 @@ void RetryAfterFailure();
 bool IsRunning();
 
 // Why it is not, if it is not. Empty while it is running or has not been tried yet.
-const char* FailureReason();
+std::string FailureReason();
 
 // The white point the exposure meter has settled on, or 0 if it has not taken a reading yet. For the
 // overlay, so the number in use is visible rather than inferred.

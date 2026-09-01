@@ -18,6 +18,7 @@
 #include <proxies/NVNGX_Proxy.h>
 #include <gpu_time/GpuTime_Dx12.h>
 
+#include <atomic>
 #include <mutex>
 #include <algorithm>
 #include <cstring>
@@ -284,7 +285,8 @@ void CheckCaptureTrigger()
     if (std::filesystem::exists(trigger, ec))
     {
         std::filesystem::remove(trigger, ec);
-        DlssNr::RequestCapture(capture::kMaxFrames);
+        ClearCaptureDirectory();
+        g_capture.request(capture::kMaxFrames);
         LOG_INFO("DLSS-NR capture requested by trigger file");
     }
 }
@@ -741,6 +743,59 @@ namespace DlssNr
 // holding two threads apart -- but the D3D11-on-D3D12 bridge enters from its own call site, and the
 // cost is a CPU-side lock on a path that already records command lists.
 std::mutex g_nrMutex;
+std::mutex g_nrPreferenceMutex;
+std::atomic<int> g_nrRequestedEnabled { -1 };
+std::atomic_bool g_nrEvaluationLatched { false };
+
+void LatchEvaluation()
+{
+    if (!g_nrEvaluationLatched.exchange(true, std::memory_order_acq_rel))
+        LOG_INFO("DLSS-NR evaluation latched on until process restart");
+}
+
+bool ShouldEvaluateThisSession()
+{
+    if (g_nrEvaluationLatched.load(std::memory_order_acquire))
+        return true;
+
+    int requested = g_nrRequestedEnabled.load(std::memory_order_acquire);
+
+    if (requested < 0)
+    {
+        std::lock_guard<std::mutex> preferenceLock(g_nrPreferenceMutex);
+        requested = g_nrRequestedEnabled.load(std::memory_order_relaxed);
+
+        if (requested < 0)
+        {
+            requested = Config::Instance()->DlssNrEnabled.value_or_default() ? 1 : 0;
+            g_nrRequestedEnabled.store(requested, std::memory_order_release);
+        }
+    }
+
+    if (requested != 0)
+        LatchEvaluation();
+
+    return g_nrEvaluationLatched.load(std::memory_order_acquire);
+}
+
+bool IsEvaluationLatched() { return g_nrEvaluationLatched.load(std::memory_order_acquire); }
+
+void SetEnabledPreference(Config* config, bool enabled)
+{
+    if (config == nullptr)
+        return;
+
+    std::lock_guard<std::mutex> preferenceLock(g_nrPreferenceMutex);
+
+    // Publish the requested state before changing the non-atomic Config optional. Render-side callers
+    // use this atomic after initialization and stop reading the optional while the UI can mutate it.
+    if (!enabled && g_nrEvaluationLatched.load(std::memory_order_acquire))
+        LOG_INFO("DLSS-NR disable requested; evaluation remains latched until process restart (use Save Settings to "
+                 "persist the preference)");
+
+    g_nrRequestedEnabled.store(enabled ? 1 : 0, std::memory_order_release);
+    config->DlssNrEnabled = enabled;
+}
 
 void RetryAfterFailure()
 {
@@ -769,7 +824,7 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
     std::lock_guard<std::mutex> nrLock(g_nrMutex);
     const Config& cfg = *Config::Instance();
 
-    if (!cfg.DlssNrEnabled.value_or_default())
+    if (!ShouldEvaluateThisSession())
     {
         ReportSkipOnce("it is switched off");
         return;
@@ -1357,19 +1412,36 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
     device->Release();
 }
 
-bool IsRunning() { return g_nr.feature != nullptr && !g_nr.failed; }
+bool IsRunning()
+{
+    std::lock_guard<std::mutex> nrLock(g_nrMutex);
+    return g_nr.feature != nullptr && !g_nr.failed;
+}
 
-const char* FailureReason() { return g_nr.failed ? g_nr.reason : ""; }
+std::string FailureReason()
+{
+    std::lock_guard<std::mutex> nrLock(g_nrMutex);
+    return g_nr.failed ? g_nr.reason : "";
+}
 
-std::optional<double> LastGpuTime() { return g_lastGpuTime; }
+std::optional<double> LastGpuTime()
+{
+    std::lock_guard<std::mutex> nrLock(g_nrMutex);
+    return g_lastGpuTime;
+}
 
 void RequestCapture(unsigned int frames)
 {
+    std::lock_guard<std::mutex> nrLock(g_nrMutex);
     ClearCaptureDirectory();
     g_capture.request(frames);
 }
 
-bool CaptureInProgress() { return g_capture.isActive(); }
+bool CaptureInProgress()
+{
+    std::lock_guard<std::mutex> nrLock(g_nrMutex);
+    return g_capture.isActive();
+}
 
 void Shutdown()
 {

@@ -39,7 +39,7 @@ void RenderMenu(Config* config, float menuResScale)
 
         bool enabled = config->DlssNrEnabled.value_or_default();
         if (ImGui::Checkbox("Enable Neural Rendering", &enabled))
-            config->DlssNrEnabled = enabled;
+            DlssNr::SetEnabledPreference(config, enabled);
 
         HelpMarker("Synthesises detail in the upscaler's output, before frame generation sees it."
                        "\n\nNeeds two similarly named files beside OptiScaler, one character apart:"
@@ -47,17 +47,21 @@ void RenderMenu(Config* config, float menuResScale)
                        "\n  nvngx.dll_dlssnr.dll   the forwarder (~13 KB) -- ships in this package"
                        "\nUndocumented and driven directly, so none of this is officially supported.");
 
-        // The toggle can be bound to a key, and nobody would think to look for it under Keybinds
-        // unless told. Dimmed, because it is a note rather than a setting.
-        ImGui::TextDisabled("Can be toggled with a key -- bind it under Keybinds, \"Neural Rendering\".");
+        // Enabling is live. Disabling an already-running undocumented NGX feature is restart-only:
+        // there is no public way to drain its asynchronous driver work safely.
+        ImGui::TextDisabled("The keybind is under Keybinds, \"Neural Rendering\".");
+
+        if (!enabled && DlssNr::IsEvaluationLatched())
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
+                               "Still running this session; Save Settings, then restart to turn it off safely.");
 
         if (!DlssNr::IsRunning())
         {
-            const char* reason = DlssNr::FailureReason();
+            const std::string reason = DlssNr::FailureReason();
 
-            if (reason[0] != 0)
+            if (!reason.empty())
             {
-                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.35f, 1.0f), "Off for this session: %s.", reason);
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.35f, 1.0f), "Off for this session: %s.", reason.c_str());
                 ImGui::SameLine();
 
                 if (ImGui::SmallButton("Retry"))
