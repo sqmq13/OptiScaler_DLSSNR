@@ -744,10 +744,10 @@ std::mutex g_nrMutex;
 
 void RetryAfterFailure()
 {
+    std::lock_guard<std::mutex> nrLock(g_nrMutex);
     g_nr.failed = false;
     g_nr.reason = "";
     g_nr.reset = true;
-
 }
 
 // Every way out of the pass before it does anything is silent on purpose -- an evaluate that carries

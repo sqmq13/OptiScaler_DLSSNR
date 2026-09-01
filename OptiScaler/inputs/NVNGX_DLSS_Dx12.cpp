@@ -1156,19 +1156,20 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
         {
             LOG_DEBUG("Passthrough to native DLSS EvaluateFeature for handle {}", handleId);
 
-            // A native feature can reach this branch without TryEvaluateOptiFeature's restoration
-            // scope. Only append NR when the game's compute state was captured first; otherwise run
-            // the native feature unchanged and fail closed for NR instead of leaking injected state.
-            const bool wantsDlssNr =
-                cfg.DlssNrEnabled.value_or_default() && feature != NVSDK_NGX_Feature_FrameGeneration;
-            bool guardDlssNrState = false;
+            // A native feature reaches this branch without TryEvaluateOptiFeature's restoration scope.
+            // Keep the native upscale and optional NR pass in one captured boundary; if capture is not
+            // possible, run the native feature unchanged and fail closed for NR.
+            const bool isUpscaleFeature = feature != NVSDK_NGX_Feature_FrameGeneration;
+            const bool wantsDlssNr = cfg.DlssNrEnabled.value_or_default() && isUpscaleFeature;
+            bool guardNativeUpscaleState = false;
 
-            if (wantsDlssNr && cfg.RestoreComputeSignature.value_or_default())
+            // Preserve the same native-upscaler tracking/restoration boundary whether NR is on or off.
+            if (isUpscaleFeature && cfg.RestoreComputeSignature.value_or_default())
             {
                 D3D12Hooks::HookToCommandListLate(InCmdList);
-                guardDlssNrState = D3D12Hooks::CanRestoreRootSignature(InCmdList);
+                guardNativeUpscaleState = D3D12Hooks::CanRestoreRootSignature(InCmdList);
 
-                if (guardDlssNrState)
+                if (guardNativeUpscaleState)
                     D3D12Hooks::SetRootSignatureTracking(false);
             }
 
@@ -1176,12 +1177,12 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
                 NVNGXProxy::D3D12_EvaluateFeature()(InCmdList, InFeatureHandle, InParameters, InCallback);
             LOG_DEBUG("Native DLSS EvaluateFeature result: 0x{:X}", (uint32_t) result);
 
-            if (guardDlssNrState)
+            if (guardNativeUpscaleState)
             {
                 // Neural Rendering runs over what the upscaler just wrote, on the same list, so frame
                 // generation interpolates from enhanced frames and the model still costs one run per
                 // rendered frame. Tracking stays disabled until both native NGX and NR have finished.
-                if (result == NVSDK_NGX_Result_Success)
+                if (result == NVSDK_NGX_Result_Success && wantsDlssNr)
                     DlssNr::EvaluateAfterUpscale(InCmdList, InParameters);
 
                 D3D12Hooks::RestoreRoot(InCmdList);
