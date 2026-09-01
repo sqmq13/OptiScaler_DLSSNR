@@ -93,6 +93,25 @@ SamplerState        gLinear   : register(s0);  // so the edit can be read at a d
 
 static const float3 kLuma = float3(0.2126, 0.7152, 0.0722);
 
+// Portable across the release shader's SM5/DXBC toolchain. Inspecting the exponent catches both
+// infinities and every NaN payload without relying on isnan/isinf intrinsics that FXC does not accept.
+bool HasNonFinite(float3 v)
+{
+    return any((asuint(v) & uint3(0x7F800000u, 0x7F800000u, 0x7F800000u)) ==
+               uint3(0x7F800000u, 0x7F800000u, 0x7F800000u));
+}
+
+float3 ApplyComparisonFrame(float3 colour, bool outsideFrame, bool onDivider, float whitePoint)
+{
+    if (outsideFrame)
+        colour = float3(0.0, 0.0, 0.0);
+
+    if (onDivider)
+        colour = float3(whitePoint, whitePoint, whitePoint);
+
+    return colour;
+}
+
 // sRGB rather than a plain 2.2 power: it is what an SDR game buffer actually carries, and the model was
 // trained on those.
 float3 LinearToSrgb(float3 v)
@@ -141,19 +160,24 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     if (gMode == 0)
     {
         float4 source = gSource.Load(int3(id.xy, 0));
-        float3 frame = max(source.rgb, float3(0.0, 0.0, 0.0));
 
-        // Kept so the resolve has the frame as it was, rather than having to reconstruct it.
-        gKeep[id.xy] = float4(frame, source.a);
+        // Keep the upscaler output value-for-value. Scene-linear HDR commonly contains negative channel
+        // values after wide-gamut colour transforms; clamping those here corrupts colour even when
+        // Neural Rendering's transfer strength is zero.
+        gKeep[id.xy] = source;
 
         // Some games hand DLSS a frame that has already been through their tonemapper. The game says
         // which in its own DLSS creation flags, and converting one that needs no conversion is pure
         // damage, so it goes through untouched.
         if (gPassthrough != 0)
         {
-            gTarget[id.xy] = float4(frame, source.a);
+            gTarget[id.xy] = source;
             return;
         }
+
+        // Only the display-referred proxy needs non-negative light. The preserved HDR frame above
+        // must retain its signed values for the game's own downstream colour pipeline.
+        float3 frame = max(source.rgb, float3(0.0, 0.0, 0.0));
 
         // What the model is shown. Mode 2 -- the default -- scales the frame and encodes it, and that
         // is all: the game is going to tone map this picture later, so tone mapping it here as well
@@ -217,6 +241,15 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         onDivider = abs(uv.x - gCompareSplit) < (1.0 / max(gWidth, 1u));
     }
 
+    // A zero-strength pass is an exact identity operation. Branch before sampling or evaluating any
+    // model-derived value: HLSL lerp is x + s * (y - x), so 0 * NaN is still NaN and can corrupt an
+    // otherwise untouched HDR frame.
+    if (gCompareMode == 0 && gDebugView == 0 && gTransferStrength <= 0.0)
+    {
+        gTarget[id.xy] = gOriginal.Load(int3(id.xy, 0));
+        return;
+    }
+
     // Sampled rather than loaded: when the model ran at a reduced resolution these are smaller than the
     // frame, and its edit is enlarged here while the frame underneath stays untouched.
     float4 proxySample = gSource.SampleLevel(gLinear, cmpUv, 0);
@@ -228,6 +261,23 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     float4 originalSample = gCompareMode == 1 ? gOriginal.SampleLevel(gLinear, cmpUv, 0)
                                               : gOriginal.Load(int3(id.xy, 0));
 
+    if (showOriginal)
+    {
+        gTarget[id.xy] = float4(ApplyComparisonFrame(originalSample.rgb, outsideFrame, onDivider,
+                                                     gWhitePoint), originalSample.a);
+        return;
+    }
+
+    // The experimental model can report success while returning a non-finite pixel. Never allow one
+    // bad model value to poison the game's HDR target. A non-finite native pixel is likewise passed
+    // through unchanged instead of feeding it into the composition math.
+    if (HasNonFinite(originalSample.rgb) || HasNonFinite(proxy) || HasNonFinite(model))
+    {
+        gTarget[id.xy] = float4(ApplyComparisonFrame(originalSample.rgb, outsideFrame, onDivider,
+                                                     gWhitePoint), originalSample.a);
+        return;
+    }
+
     // All three pictures have to share a scale before their luminances can be compared. The proxy and
     // the model come back from an sRGB decode, so they sit in 0..1 where 1 is the white point; the
     // frame is raw linear and runs well past that. Comparing them unnormalised is a real bug and it
@@ -236,7 +286,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // the result to a near-constant scale. Colour still moves, because that comes from the model's
     // own hue, which is what makes the failure so confusing to look at.
     const float normScale = gPassthrough != 0 ? 1.0 : max(gWhitePoint, 1e-4);
-    float3 original = originalSample.rgb / normScale;
+    float3 originalBase = max(originalSample.rgb, float3(0.0, 0.0, 0.0));
+    float3 original = originalBase / normScale;
 
     float originalLuma = dot(original, kLuma);
     float proxyLuma = dot(proxy, kLuma);
@@ -323,23 +374,28 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // luminance approaches zero. No edit at all is the right answer for a pixel with no light in it.
     const float kRatioFloor = 1.0 / 512.0;
     float lumaRatio = clamp((upgradedLuma + kRatioFloor) / (originalLuma + kRatioFloor), 0.0, gMaxRatio);
-    float3 result = lerp(original * lumaRatio, upgraded, gColourStrength);
+    float3 boundedLuma = original * lumaRatio;
 
-    // Back out of the normalised space the composition worked in.
-    result *= normScale;
+    // ColourStrength used to lerp all the way to raw `upgraded`. At its default of 1 that bypassed
+    // MaxRatio completely, allowing a bad model result to drive an HDR frame white. Preserve the
+    // model's chroma, but first put that endpoint on the same capped luminance as the ratio-only one.
+    const float targetLuma = originalLuma * lumaRatio;
+    float3 boundedColour = upgradedLuma > 1e-6 ? upgraded * (targetLuma / upgradedLuma) : boundedLuma;
+    float3 result = lerp(boundedLuma, boundedColour, saturate(gColourStrength));
 
-    // The side being shown untouched takes the frame as it arrived, past every step above.
-    if (showOriginal)
+    // Apply only the model's delta to the signed HDR source. This preserves negative wide-gamut
+    // components instead of silently clipping them out of the game's downstream colour transform.
+    result = originalSample.rgb + (result * normScale - originalBase);
+
+    // Composition can overflow even when every input was finite. In that case the only safe output is
+    // the native frame; a single infinity written into FP16 can contaminate the later HDR transform.
+    if (HasNonFinite(result))
         result = originalSample.rgb;
 
     // The letterbox. The sampler clamps rather than wrapping, so without this the bars would be the
     // frame's edge row smeared down the screen.
-    if (outsideFrame)
-        result = float3(0.0, 0.0, 0.0);
+    // A hairline keeps the two comparison sides from being mistaken for one picture.
+    result = ApplyComparisonFrame(result, outsideFrame, onDivider, gWhitePoint);
 
-    // A hairline so the two sides are never mistaken for one picture.
-    if (onDivider)
-        result = float3(gWhitePoint, gWhitePoint, gWhitePoint);
-
-    gTarget[id.xy] = float4(max(result, float3(0.0, 0.0, 0.0)), originalSample.a);
+    gTarget[id.xy] = float4(result, originalSample.a);
 }

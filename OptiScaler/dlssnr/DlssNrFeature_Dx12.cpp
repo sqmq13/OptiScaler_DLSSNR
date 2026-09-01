@@ -808,6 +808,68 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
     const auto width = (unsigned int) desc.Width;
     const auto height = desc.Height;
 
+    // These are the game's exposure inputs to DLSS, read before this pass changes any resource or
+    // parameter. They are diagnostics first: display calibration (nits after tone mapping) is not the
+    // same quantity as scene-linear pre-exposure, so never derive one from the other by guesswork.
+    float preExposure = 1.0f;
+    float exposureScale = 1.0f;
+    const auto preExposureResult =
+        params->Get(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &preExposure);
+    const auto exposureScaleResult =
+        params->Get(NVSDK_NGX_Parameter_DLSS_Exposure_Scale, &exposureScale);
+
+    ID3D12Resource* exposureTexture = nullptr;
+    auto exposureTextureResult =
+        params->Get(NVSDK_NGX_Parameter_ExposureTexture, &exposureTexture);
+
+    if (exposureTextureResult != NVSDK_NGX_Result_Success || exposureTexture == nullptr)
+    {
+        void* untypedExposure = nullptr;
+        const auto untypedResult =
+            params->Get(NVSDK_NGX_Parameter_ExposureTexture, &untypedExposure);
+
+        if (untypedResult == NVSDK_NGX_Result_Success && untypedExposure != nullptr)
+        {
+            exposureTexture = static_cast<ID3D12Resource*>(untypedExposure);
+            exposureTextureResult = untypedResult;
+        }
+    }
+
+    // Report the first value and material changes, with a hard cap for games whose exposure changes
+    // every frame. Merely reading GetDesc is CPU-side metadata; the texture is never transitioned,
+    // mapped, retained or released here.
+    static unsigned int exposureReportCount = 0;
+    static float lastPreExposure = 0.0f;
+    static float lastExposureScale = 0.0f;
+    static ID3D12Resource* lastExposureTexture = nullptr;
+    const bool exposureChanged = exposureReportCount == 0 || preExposure != lastPreExposure ||
+                                 exposureScale != lastExposureScale ||
+                                 exposureTexture != lastExposureTexture;
+
+    if (exposureChanged && exposureReportCount < 32)
+    {
+        ++exposureReportCount;
+        lastPreExposure = preExposure;
+        lastExposureScale = exposureScale;
+        lastExposureTexture = exposureTexture;
+
+        if (exposureTexture != nullptr)
+        {
+            const auto exposureDesc = exposureTexture->GetDesc();
+            LOG_INFO("DLSS-NR exposure input: pre {} (0x{:X}), scale {} (0x{:X}), texture {}x{} "
+                     "format {} (0x{:X})",
+                     preExposure, (unsigned int) preExposureResult, exposureScale,
+                     (unsigned int) exposureScaleResult, exposureDesc.Width, exposureDesc.Height,
+                     (unsigned int) exposureDesc.Format, (unsigned int) exposureTextureResult);
+        }
+        else
+        {
+            LOG_INFO("DLSS-NR exposure input: pre {} (0x{:X}), scale {} (0x{:X}), no texture (0x{:X})",
+                     preExposure, (unsigned int) preExposureResult, exposureScale,
+                     (unsigned int) exposureScaleResult, (unsigned int) exposureTextureResult);
+        }
+    }
+
     // Depth and motion vectors are the upscaler's inputs and so are at render resolution, while colour
     // and output are at display resolution. The model takes that as a subrect per resource rather than
     // needing them resampled, which is why nothing here rescales anything.
@@ -1231,13 +1293,13 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
         Barrier(cmdList, g_nr.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-        // On-demand capture works in this path too: the staging copy still holds the frame as the
-        // upscaler produced it, and the edited frame is the output itself. The write happens a few
+        // On-demand capture works in this path too: hdrCopy holds the signed linear frame exactly as
+        // the upscaler produced it, and the edited frame is the output itself. The write happens a few
         // frames later, once the GPU is certainly past these copies -- this path has no fence of its
         // own.
         if (g_capture.isActive())
         {
-            g_capture.record(cmdList, device, g_nr.colorCopy,
+            g_capture.record(cmdList, device, g_nr.hdrCopy,
                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, target,
                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
@@ -1372,4 +1434,3 @@ void Shutdown()
     g_compose.reset();
 }
 } // namespace DlssNr
-

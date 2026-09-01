@@ -256,17 +256,17 @@ void RenderMenu(Config* config, float menuResScale)
         {
             ImGui::TextDisabled("Capturing...");
         }
-        else if (ImGui::Button("Capture 8 frames"))
+        else if (ImGui::Button("Capture one raw HDR pair"))
         {
-            DlssNr::RequestCapture(8);
+            DlssNr::RequestCapture(1);
         }
 
-        HelpMarker("Writes eight consecutive frames twice: as the upscaler produced them, and again"
+        HelpMarker("Writes one frame twice: as the upscaler produced it, and again"
                        "\nonce the model's edit was applied."
-                       "\n\nSame frames, same run, one variable -- which is what comparing two video"
+                       "\n\nSame frame, same run, one variable -- which is what comparing two video"
                        "\ncaptures can never be, since they have different camera paths and a codec in"
                        "\nbetween that discards exactly the fine temporal detail in question."
-                       "\n\nRaw, into a dlssnr-capture folder beside OptiScaler. Bounded to eight frames,"
+                       "\n\nRaw, into a dlssnr-capture folder beside OptiScaler. Bounded to one pair,"
                        "\nand each run overwrites the last.");
 
         static const char* compareNames[] = { "Off", "Side by side", "Wipe" };
@@ -337,4 +337,3 @@ void RenderMenu(Config* config, float menuResScale)
 }
 
 } // namespace DlssNr
-

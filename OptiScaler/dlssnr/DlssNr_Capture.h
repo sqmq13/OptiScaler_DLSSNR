@@ -23,9 +23,10 @@
 
 namespace capture
 {
-// Bounded on purpose: this writes hundreds of megabytes and must not be able to fill a drive. Each run
-// overwrites the last.
-constexpr unsigned int kMaxFrames = 8;
+// Bounded to one diagnostic pair. At 4K RGBA16F, eight before/after pairs reserve roughly a gigabyte
+// of readback memory; one raw pair is enough to verify whether the HDR signal was preserved while
+// keeping pressure low during GPU-timeout diagnosis. Each run overwrites the last.
+constexpr unsigned int kMaxFrames = 1;
 
 struct Shot
 {

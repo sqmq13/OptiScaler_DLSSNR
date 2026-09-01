@@ -1,0 +1,55 @@
+name: Build RE9 HDR Safety
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Compile Neural Rendering shader with native FXC
+        shell: cmd
+        working-directory: OptiScaler\shaders\dlssnr\precompile
+        run: |
+          ..\..\shader_tools\fxc.exe /T cs_5_0 /E CSMain /O3 dlssnr.hlsl /Fo DlssNr_Shader.cso
+          py -3 ..\..\shader_tools\create_header.py DlssNr_Shader.cso DlssNr_Shader.h DlssNr_cso
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build OptiScaler
+        run: msbuild /m /p:Configuration=Release . /verbosity:minimal
+
+      - name: Collect artifact and provenance
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          Copy-Item -Recurse -Force x64\Release\a\* staging\
+          Copy-Item -Force OptiScaler\shaders\dlssnr\precompile\DlssNr_Shader.cso staging\
+          $commit = git rev-parse HEAD
+          $shaderSource = (Get-FileHash OptiScaler\shaders\dlssnr\precompile\dlssnr.hlsl -Algorithm SHA256).Hash.ToLower()
+          $shaderBinary = (Get-FileHash OptiScaler\shaders\dlssnr\precompile\DlssNr_Shader.cso -Algorithm SHA256).Hash.ToLower()
+          @(
+            "commit=$commit"
+            "shader_source_sha256=$shaderSource"
+            "shader_binary_sha256=$shaderBinary"
+            "configuration=Release"
+            "shader_compiler=repository FXC on windows-latest"
+          ) | Set-Content -Encoding ascii staging\RE9-HDR-SAFETY-BUILD.txt
+          7z a -r OptiScaler_RE9_HDR_Safety.7z .\staging\* | Out-Host
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: OptiScaler_RE9_HDR_Safety
+          path: OptiScaler_RE9_HDR_Safety.7z
+          archive: false
+          compression-level: 0
+          if-no-files-found: error
